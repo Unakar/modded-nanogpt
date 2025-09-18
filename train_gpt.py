@@ -276,6 +276,191 @@ class DistAdam(torch.optim.Optimizer):
         torch.futures.collect_all(all_reduce_futures).wait()
 
 # -----------------------------------------------------------------------------
+# Logging utilities and initialization config
+
+def _rms(x: Tensor) -> Tensor:
+    return (x.to(torch.float32).pow(2).mean()).sqrt()
+
+def _approx_spec_norm(w: Tensor, n_iter: int = 10) -> float:
+    with torch.no_grad():
+        if w.ndim != 2:
+            w = w.flatten(1)
+        device = w.device
+        dtype = torch.float32
+        u = torch.randn((w.size(0), 1), device=device, dtype=dtype)
+        v = torch.randn((w.size(1), 1), device=device, dtype=dtype)
+        u = u / (u.norm() + 1e-12)
+        v = v / (v.norm() + 1e-12)
+        w32 = w.to(dtype)
+        for _ in range(n_iter):
+            v = (w32.mT @ u)
+            v = v / (v.norm() + 1e-12)
+            u = (w32 @ v)
+            u = u / (u.norm() + 1e-12)
+        sigma = (u.mT @ (w32 @ v)).abs().item()
+        return float(sigma)
+
+def _scale_to_spec_norm_(w: Tensor, target_smax: float, clip_only: bool = False, n_iter: int = 10):
+    with torch.no_grad():
+        smax = _approx_spec_norm(w, n_iter=n_iter)
+        if smax <= 0:
+            return
+        scale = target_smax / smax
+        if clip_only and scale > 1:
+            return
+        w.mul_(scale)
+
+@dataclass
+class InitConfig:
+    linear_method: str = os.getenv("INIT_LINEAR_METHOD", "default")  # default|spec_norm|sv_clip|normal_0p02|normal_6e-3
+    per_head_attn: bool = os.getenv("INIT_PER_HEAD", "1") == "1"     # per-head init for qkv
+    embed_method: str = os.getenv("INIT_EMBED_METHOD", "default")     # default|std_0p25
+    head_method: str = os.getenv("INIT_HEAD_METHOD", "default")       # default|30_over_d
+    spec_log_every: int = int(os.getenv("SPEC_LOG_EVERY", "25"))
+
+def _apply_linear_init_(w: Tensor, method: str):
+    with torch.no_grad():
+        out_features, in_features = w.shape[0], w.shape[1]
+        if method == "default":
+            return
+        elif method == "normal_0p02":
+            w.normal_(mean=0.0, std=0.02)
+        elif method == "normal_6e-3":
+            w.normal_(mean=0.0, std=6e-3)
+        elif method in ("spec_norm", "sv_clip"):
+            target = (out_features / max(in_features, 1)) ** 0.5
+            _scale_to_spec_norm_(w, target_smax=target, clip_only=(method == "sv_clip"))
+        else:
+            raise ValueError(f"Unknown linear init method: {method}")
+
+def _init_qkv_per_head_(qkv_w: Tensor, method: str, head_dim: int, per_head: bool):
+    with torch.no_grad():
+        if not per_head:
+            for i in range(3):
+                w = qkv_w[i].view(-1, qkv_w.size(-1))
+                _apply_linear_init_(w, method)
+            return
+        q_size = qkv_w.size(1) // head_dim
+        for i in range(3):
+            for h in range(q_size):
+                w = qkv_w[i, h * head_dim:(h + 1) * head_dim, :]
+                _apply_linear_init_(w, method)
+
+def _apply_model_init(model: nn.Module, cfg: InitConfig):
+    if cfg.embed_method == "std_0p25":
+        for m in [model.embed, *list(model.value_embeds)]:
+            with torch.no_grad():
+                m.weight.normal_(mean=0.0, std=0.25)
+    for block in model.blocks:
+        attn = block.attn
+        if attn is not None:
+            _init_qkv_per_head_(attn.qkv_w, cfg.linear_method, attn.head_dim, cfg.per_head_attn)
+            _apply_linear_init_(attn.c_proj.weight, cfg.linear_method)
+        _apply_linear_init_(block.mlp.c_fc.weight, cfg.linear_method)
+        _apply_linear_init_(block.mlp.c_proj.weight, cfg.linear_method)
+    if cfg.head_method == "30_over_d":
+        with torch.no_grad():
+            d = model.lm_head.weight.size(1)
+            model.lm_head.weight.normal_(mean=0.0, std=(30.0 / max(d, 1)))
+
+class _WB:
+    def __init__(self, enabled: bool, config: dict):
+        self.enabled = False
+        self.fallback = None
+        self.run = None
+        if enabled:
+            try:
+                import wandb  # type: ignore
+                mode = os.getenv("WANDB_MODE", "offline")
+                project = os.getenv("WANDB_PROJECT", "modded-nanogpt")
+                name = os.getenv("EXP_NAME", f"exp-{uuid.uuid4().hex[:8]}")
+                self.run = wandb.init(project=project, name=name, config=config, mode=mode, reinit=True)
+                self.enabled = True
+            except Exception:
+                self.enabled = False
+        if not self.enabled:
+            os.makedirs("logs", exist_ok=True)
+            self.fallback = open(os.path.join("logs", f"wandb_fallback_{int(time.time())}.jsonl"), "a", buffering=1)
+
+    def log(self, data: dict, step: int | None = None):
+        try:
+            if self.enabled and self.run is not None:
+                import wandb  # type: ignore
+                wandb.log(data, step=step)
+            elif self.fallback is not None:
+                import json
+                line = json.dumps({"step": step, **data}, ensure_ascii=False)
+                self.fallback.write(line + "\n")
+        except Exception:
+            pass
+
+    def close(self):
+        try:
+            if self.enabled and self.run is not None:
+                self.run.finish()
+            if self.fallback is not None:
+                self.fallback.close()
+        except Exception:
+            pass
+
+class IoRmsHooks:
+    def __init__(self, module_name_map: dict[nn.Module, str]):
+        self.pre: dict[str, float] = {}
+        self.post: dict[str, float] = {}
+        self.module_name_map = module_name_map
+        self.handles: list[torch.utils.hooks.RemovableHandle] = []
+
+    def _pre(self, name: str, mod: nn.Module, inp: tuple):
+        try:
+            x = None
+            for t in inp:
+                if isinstance(t, Tensor):
+                    x = t
+                    break
+            if x is not None:
+                with torch.no_grad():
+                    v = x.detach().to(torch.float32)
+                    self.pre[name] = float((v.pow(2).mean().sqrt()).item())
+        except Exception:
+            pass
+
+    def _post(self, name: str, mod: nn.Module, inp: tuple, out: Tensor | tuple | list | None):
+        try:
+            is_compiling = getattr(torch._dynamo, "is_compiling", lambda: False)
+            if is_compiling():
+                return
+            y = None
+            if isinstance(out, Tensor):
+                y = out
+            elif isinstance(out, (tuple, list)) and out and isinstance(out[0], Tensor):
+                y = out[0]
+            if y is not None:
+                with torch.no_grad():
+                    v = y.detach().to(torch.float32)
+                    self.post[name] = float((v.pow(2).mean().sqrt()).item())
+        except Exception:
+            pass
+
+    def attach(self, model: nn.Module):
+        for m in model.modules():
+            if isinstance(m, (nn.Embedding, CastedLinear)):
+                name = self.module_name_map.get(m, m.__class__.__name__)
+                self.handles.append(m.register_forward_pre_hook(partial(self._pre, name)))
+                self.handles.append(m.register_forward_hook(partial(self._post, name)))
+
+    def clear_step(self):
+        self.pre.clear()
+        self.post.clear()
+
+    def detach(self):
+        for h in self.handles:
+            try:
+                h.remove()
+            except Exception:
+                pass
+        self.handles.clear()
+
+# -----------------------------------------------------------------------------
 # PyTorch nn.Module definitions for the model
 
 def norm(x: Tensor):
@@ -419,6 +604,15 @@ class GPT(nn.Module):
         self.lm_head.weight.lr_mul = 27.5
         self.scalars.lr_mul = 5.0
 
+    def iter_linear_params(self):
+        # Iterate over linear-like weights inside transformer blocks for logging/analysis
+        for bi, block in enumerate(self.blocks):
+            if block.attn is not None:
+                yield f"blocks.{bi}.attn.c_proj.weight", block.attn.c_proj.weight
+                yield f"blocks.{bi}.attn.qkv_w", block.attn.qkv_w
+            yield f"blocks.{bi}.mlp.c_fc.weight", block.mlp.c_fc.weight
+            yield f"blocks.{bi}.mlp.c_proj.weight", block.mlp.c_proj.weight
+
     def create_blockmasks(self, input_seq: Tensor, sliding_window_num_blocks: Tensor):
         BLOCK_SIZE = 128
         docs = (input_seq == 50256).cumsum(0)
@@ -555,8 +749,8 @@ def distributed_data_generator(filename_pattern: str, batch_size: int, align_to_
 @dataclass
 class Hyperparameters:
     # data
-    train_files = "data/fineweb10B/fineweb_train_*.bin" # input .bin to train on
-    val_files = "data/fineweb10B/fineweb_val_*.bin" # input .bin to eval validation loss on
+    train_files = "data/fineweb_train_*.bin" # input .bin to train on
+    val_files = "data/fineweb_val_*.bin" # input .bin to eval validation loss on
     val_tokens = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
     train_seq_len = 48*1024 # FlexAttention sequence length
     val_seq_len = 4*64*1024 # FlexAttention sequence length for validation
@@ -612,6 +806,51 @@ for m in model.modules():
 for param in model.parameters():
     dist.broadcast(param.detach(), 0)
 
+# Apply configurable initialization (and re-broadcast)
+init_cfg = InitConfig()
+if master_process:
+    print0(f"InitConfig: {init_cfg}")
+_apply_model_init(model, init_cfg)
+for param in model.parameters():
+    dist.broadcast(param.detach(), 0)
+
+# Optional wandb logger
+wb = _WB(enabled=master_process and (os.getenv("ENABLE_WANDB", "1") == "1"), config={
+    "exp_name": os.getenv("EXP_NAME", "exp"),
+    "world_size": world_size,
+    "model_dim": 768,
+    "num_layers": 12,
+    "num_heads": 6,
+})
+
+# Log initialization sanity metrics
+if master_process:
+    init_metrics = {}
+    with torch.no_grad():
+        for name, w in model.iter_linear_params():
+            try:
+                if w.ndim == 3:
+                    w2d = w.flatten(0, 1)
+                else:
+                    w2d = w
+                init_metrics[f"init/weight_rms/{name}"] = float(_rms(w2d).item())
+            except Exception:
+                pass
+        # embeddings and head
+        init_metrics["init/weight_rms/embed"] = float(_rms(model.embed.weight).item())
+        for i, ve in enumerate(model.value_embeds):
+            init_metrics[f"init/weight_rms/value_embed.{i}"] = float(_rms(ve.weight).item())
+        init_metrics["init/weight_rms/lm_head"] = float(_rms(model.lm_head.weight).item())
+    wb.log(init_metrics, step=0)
+
+# Optional I/O RMS hooks
+ENABLE_IO_RMS = os.getenv("LOG_IO_RMS", "1") == "1"
+io_hooks = None
+if ENABLE_IO_RMS:
+    module_name_map = {m: n for n, m in model.named_modules()}
+    io_hooks = IoRmsHooks(module_name_map)
+    io_hooks.attach(model)
+
 # collect the parameters to optimize
 hidden_matrix_params = [p for n, p in model.blocks.named_parameters() if p.ndim >= 2 and "embed" not in n]
 embed_params = [p for n, p in model.named_parameters() if "embed" in n]
@@ -650,7 +889,8 @@ def get_window_size_blocks(step: int):
     window_size = next_multiple_of_n(1728 * x, n=128)
     return get_window_size_blocks_helper(window_size)
 
-model: nn.Module = torch.compile(model, dynamic=False)
+if os.getenv("TORCH_COMPILE", "1") == "1":
+    model = torch.compile(model, dynamic=False)
 
 ########################################
 #            Warmup kernels            #
@@ -663,7 +903,8 @@ initial_state = dict(model=copy.deepcopy(model.state_dict()),
 train_loader = distributed_data_generator(args.train_files, world_size * args.train_seq_len, align_to_bos=True)
 for _ in range(warmup_steps):
     inputs, targets = next(train_loader)
-    model(inputs, targets, get_window_size_blocks(1)).backward()
+    loss = model(inputs, targets, get_window_size_blocks(1))
+    loss.backward()
     for opt in optimizers:
         opt.step()
     model.zero_grad(set_to_none=True)
@@ -685,6 +926,14 @@ t0 = time.perf_counter()
 train_steps = args.num_iterations
 for step in range(train_steps + 1):
     last_step = (step == train_steps)
+    # storage for spectral norms
+    if step == 0:
+        prev_weights: dict[str, Tensor] = {}
+        for name, w in model.iter_linear_params():
+            try:
+                prev_weights[name] = w.detach().to(torch.float32).cpu().clone()
+            except Exception:
+                pass
 
     # --------------- VALIDATION SECTION -----------------
     if last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0):
@@ -705,6 +954,8 @@ for step in range(train_steps + 1):
         del val_loader
         dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
         print0(f"step:{step}/{train_steps} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step, 1):.2f}ms", console=True)
+        if master_process:
+            wb.log({"val/loss": float(val_loss)}, step=step)
         model.train()
         # start the clock again
         torch.cuda.synchronize()
@@ -720,7 +971,11 @@ for step in range(train_steps + 1):
 
     # --------------- TRAINING SECTION -----------------
     inputs, targets = next(train_loader)
-    model(inputs, targets, get_window_size_blocks(step)).backward()
+    if io_hooks is not None:
+        io_hooks.clear_step()
+    loss = model(inputs, targets, get_window_size_blocks(step))
+    per_token = float(loss.item()) / float(targets.numel())
+    loss.backward()
     # set optimization hyperparameters
     for opt in optimizers:
         for group in opt.param_groups:
@@ -733,10 +988,70 @@ for step in range(train_steps + 1):
         opt.step()
     # null the gradients
     model.zero_grad(set_to_none=True)
+    # spectral norm logging (periodic)
+    if master_process and (step + 1) % max(1, init_cfg.spec_log_every) == 0:
+        spec_vals = []
+        delta_spec_vals = []
+        with torch.no_grad():
+            for name, w in model.iter_linear_params():
+                try:
+                    if w.ndim == 3:  # qkv_w [3, hdim, dim]
+                        w2d = w.flatten(0, 1)
+                    else:
+                        w2d = w
+                    s = _approx_spec_norm(w2d)
+                    spec_vals.append(s)
+                    if name in prev_weights:
+                        pw = prev_weights[name]
+                        # move to same device for subtract
+                        dw = (w2d.detach().to(torch.float32).cpu() - (pw.flatten(0, 1) if pw.ndim == 3 else pw)).to(torch.float32)
+                        ds = _approx_spec_norm(dw)
+                        delta_spec_vals.append(ds)
+                        prev_weights[name] = w.detach().to(torch.float32).cpu().clone()
+                    else:
+                        prev_weights[name] = w.detach().to(torch.float32).cpu().clone()
+                except Exception:
+                    continue
+        if spec_vals:
+            wb.log({
+                "train/spec_norm_mean": float(sum(spec_vals) / len(spec_vals)),
+                "train/delta_spec_norm_mean": float(sum(delta_spec_vals) / max(len(delta_spec_vals), 1)),
+            }, step=step + 1)
     # logging
     approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
     print0(f"step:{step+1}/{train_steps} train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms/(step + 1):.2f}ms", console=True)
+    if master_process:
+        # global grad RMS and weight RMS
+        with torch.no_grad():
+            g_sq_sum = 0.0
+            g_cnt = 0
+            w_sq_sum = 0.0
+            w_cnt = 0
+            for p in model.parameters():
+                if p.grad is not None:
+                    g_sq_sum += float(p.grad.detach().to(torch.float32).pow(2).mean().item())
+                    g_cnt += 1
+                if p.ndim >= 1:
+                    w_sq_sum += float(p.detach().to(torch.float32).pow(2).mean().item())
+                    w_cnt += 1
+            grad_rms = (g_sq_sum / max(g_cnt, 1)) ** 0.5
+            weight_rms = (w_sq_sum / max(w_cnt, 1)) ** 0.5
+        data = {"train/per_token_loss": per_token, "train/grad_rms": grad_rms, "train/weight_rms": weight_rms}
+        if io_hooks is not None:
+            for k, v in io_hooks.pre.items():
+                data[f"io_rms/{k}:in"] = v
+            for k, v in io_hooks.post.items():
+                data[f"io_rms/{k}:out"] = v
+            # per-module transform ratio: output_rms / input_rms
+            for k, in_v in io_hooks.pre.items():
+                out_v = io_hooks.post.get(k)
+                if out_v is not None:
+                    denom = in_v if in_v > 0 else 1e-12
+                    data[f"module_transform_ratio/{k}"] = float(out_v / denom)
+        wb.log(data, step=step + 1)
 
 print0(f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
        f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB", console=True)
+if master_process:
+    wb.close()
 dist.destroy_process_group()
