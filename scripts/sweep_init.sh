@@ -1,31 +1,21 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# 5 (linear) x 2 (EH pairs) x 10 (repeats) = 100 sequential runs
+# Sweep logic: 5 linear methods × 2 embed/head pairs × N repeats = total runs
 
 usage() {
   cat <<EOF
 Usage: $0 [options]
 
 Options:
-  --project        <wandb_project>
+  --project        <wandb_project>           (default: sweep_speedrun_init)
   --entity         <wandb_entity>
   --mode           online|offline|disabled   (default: online)
-  --compile        1|0                       (default: 0)
-  --log-io         1|0                       (default: 1)
-  --spec-log-every <int>                     (default: 25)
   --repeats        <int>                     (default: 10)
-  --nproc          <int GPUs>                (default: 8)
+  --nproc          <int>                     (default: 8)
+  -h|--help        Show this help
 
-EH pairs (fixed 2):
-  default: embed=default    head=default
-  scaled:  embed=std_0p25   head=30_over_d
-
-Linear methods (fixed 5):
-  default, spec_norm, sv_clip, normal_0p02, normal_6e-3
-
-Examples:
-  $0 --project your_proj --entity your_entity --mode online
+Example: $0 --project my_sweep --repeats 5
 EOF
 }
 
