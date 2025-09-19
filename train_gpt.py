@@ -7,7 +7,7 @@ import time
 import copy
 import glob
 from dataclasses import dataclass
-from functools import lru_cache, partial # Added partial for hook registration
+from functools import lru_cache
 from pathlib import Path
 
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
@@ -403,62 +403,6 @@ class _WB:
         except Exception:
             pass
 
-class IoRmsHooks:
-    def __init__(self, module_name_map: dict[nn.Module, str]):
-        self.pre: dict[str, float] = {}
-        self.post: dict[str, float] = {}
-        self.module_name_map = module_name_map
-        self.handles: list[torch.utils.hooks.RemovableHandle] = []
-
-    def _pre(self, name: str, mod: nn.Module, inp: tuple):
-        try:
-            x = None
-            for t in inp:
-                if isinstance(t, Tensor):
-                    x = t
-                    break
-            if x is not None:
-                with torch.no_grad():
-                    v = x.detach().to(torch.float32)
-                    self.pre[name] = float((v.pow(2).mean().sqrt()).item())
-        except Exception:
-            pass
-
-    def _post(self, name: str, mod: nn.Module, inp: tuple, out: Tensor | tuple | list | None):
-        try:
-            is_compiling = getattr(torch._dynamo, "is_compiling", lambda: False)
-            if is_compiling():
-                return
-            y = None
-            if isinstance(out, Tensor):
-                y = out
-            elif isinstance(out, (tuple, list)) and out and isinstance(out[0], Tensor):
-                y = out[0]
-            if y is not None:
-                with torch.no_grad():
-                    v = y.detach().to(torch.float32)
-                    self.post[name] = float((v.pow(2).mean().sqrt()).item())
-        except Exception:
-            pass
-
-    def attach(self, model: nn.Module):
-        for m in model.modules():
-            if isinstance(m, (nn.Embedding, CastedLinear)):
-                name = self.module_name_map.get(m, m.__class__.__name__)
-                self.handles.append(m.register_forward_pre_hook(partial(self._pre, name)))
-                self.handles.append(m.register_forward_hook(partial(self._post, name)))
-
-    def clear_step(self):
-        self.pre.clear()
-        self.post.clear()
-
-    def detach(self):
-        for h in self.handles:
-            try:
-                h.remove()
-            except Exception:
-                pass
-        self.handles.clear()
 
 # -----------------------------------------------------------------------------
 # PyTorch nn.Module definitions for the model
@@ -843,13 +787,6 @@ if master_process:
         init_metrics["init/weight_rms/lm_head"] = float(_rms(model.lm_head.weight).item())
     wb.log(init_metrics, step=0)
 
-# Optional I/O RMS hooks
-ENABLE_IO_RMS = os.getenv("LOG_IO_RMS", "1") == "1"
-io_hooks = None
-if ENABLE_IO_RMS:
-    module_name_map = {m: n for n, m in model.named_modules()}
-    io_hooks = IoRmsHooks(module_name_map)
-    io_hooks.attach(model)
 
 # collect the parameters to optimize
 hidden_matrix_params = [p for n, p in model.blocks.named_parameters() if p.ndim >= 2 and "embed" not in n]
@@ -971,8 +908,6 @@ for step in range(train_steps + 1):
 
     # --------------- TRAINING SECTION -----------------
     inputs, targets = next(train_loader)
-    if io_hooks is not None:
-        io_hooks.clear_step()
     loss = model(inputs, targets, get_window_size_blocks(step))
     per_token = float(loss.item()) / float(targets.numel())
     loss.backward()
@@ -1037,17 +972,6 @@ for step in range(train_steps + 1):
             grad_rms = (g_sq_sum / max(g_cnt, 1)) ** 0.5
             weight_rms = (w_sq_sum / max(w_cnt, 1)) ** 0.5
         data = {"train/per_token_loss": per_token, "train/grad_rms": grad_rms, "train/weight_rms": weight_rms}
-        if io_hooks is not None:
-            for k, v in io_hooks.pre.items():
-                data[f"io_rms/{k}:in"] = v
-            for k, v in io_hooks.post.items():
-                data[f"io_rms/{k}:out"] = v
-            # per-module transform ratio: output_rms / input_rms
-            for k, in_v in io_hooks.pre.items():
-                out_v = io_hooks.post.get(k)
-                if out_v is not None:
-                    denom = in_v if in_v > 0 else 1e-12
-                    data[f"module_transform_ratio/{k}"] = float(out_v / denom)
         wb.log(data, step=step + 1)
 
 print0(f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
